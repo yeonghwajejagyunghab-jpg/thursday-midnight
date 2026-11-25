@@ -1,0 +1,108 @@
+# Copies giscus comments (GitHub Discussions) into data/comments.json,
+# so the weekly Claude session can read them without GraphQL access.
+# Also writes data/giscus.json (repo and category ids) for the comment box.
+# Minimized (hidden) comments and replies are left out.
+name: sync-comments
+
+on:
+  discussion:
+    types: [created, edited, deleted, category_changed]
+  discussion_comment:
+    types: [created, edited, deleted]
+  schedule:
+    - cron: '30 14 * * 3'   # every Wednesday 23:30 KST, before the Thursday 00:00 run
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/sync-comments.yml']
+
+permissions:
+  contents: write
+  discussions: read
+
+concurrency:
+  group: sync-comments
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Export comments
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const PREFIX = '목요일 0시 · ';
+            const query = `query($owner:String!, $repo:String!, $cursor:String) {
+              repository(owner:$owner, name:$repo) {
+                id
+                discussionCategories(first: 25) { nodes { id name } }
+                discussions(first: 50, after: $cursor) {
+                  pageInfo { hasNextPage endCursor }
+                  nodes {
+                    title url createdAt
+                    comments(first: 100) {
+                      nodes {
+                        id createdAt body isMinimized
+                        author { login }
+                        replies(first: 50) {
+                          nodes { createdAt body isMinimized author { login } }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }`;
+
+            let cursor = null, repoId = '', cats = [], threads = [];
+            do {
+              const r = await github.graphql(query, { owner, repo, cursor });
+              const R = r.repository;
+              repoId = R.id;
+              cats = R.discussionCategories.nodes;
+              for (const d of R.discussions.nodes) {
+                if (!d.title.startsWith(PREFIX)) continue;
+                const n = parseInt(d.title.slice(PREFIX.length), 10);
+                if (!Number.isFinite(n)) continue;
+                const comments = d.comments.nodes
+                  .filter(c => !c.isMinimized)
+                  .map(c => ({
+                    author: c.author ? c.author.login : 'ghost',
+                    createdAt: c.createdAt,
+                    body: c.body,
+                    replies: c.replies.nodes
+                      .filter(x => !x.isMinimized)
+                      .map(x => ({ author: x.author ? x.author.login : 'ghost', createdAt: x.createdAt, body: x.body }))
+                  }));
+                threads.push({ n, url: d.url, comments });
+              }
+              cursor = R.discussions.pageInfo.hasNextPage ? R.discussions.pageInfo.endCursor : null;
+            } while (cursor);
+
+            threads.sort((a, b) => b.n - a.n);
+            const write = (file, obj) => {
+              const next = JSON.stringify(obj, null, 2) + '\n';
+              const prev = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+              if (prev !== next) { fs.writeFileSync(file, next); return true; }
+              return false;
+            };
+            write('data/comments.json', threads);
+
+            const pick = cats.find(c => c.name === 'Announcements') || cats.find(c => c.name === 'General') || cats[0];
+            if (pick) write('data/giscus.json', { repo: owner + '/' + repo, repoId, category: pick.name, categoryId: pick.id });
+
+      - name: Commit if changed
+        run: |
+          if [ -n "$(git status --porcelain data)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add data/comments.json data/giscus.json
+            git commit -m "댓글 동기화"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
